@@ -1,11 +1,13 @@
 import AppKit
 import Charts
+import Darwin
 import MonitorCore
 import SwiftUI
 
 @main
 struct AgentMonitorApp: App {
     @StateObject private var model = MonitorModel()
+    private static var lockFD: Int32 = -1
 
     init() {
         if CommandLine.arguments.contains("--snapshot") {
@@ -34,10 +36,30 @@ struct AgentMonitorApp: App {
             FileHandle.standardOutput.write(Data([10]))
             exit(0)
         }
+        if !Self.acquireInstanceLock() {
+            NSRunningApplication.runningApplications(withBundleIdentifier: "com.lazar.agentmonitor")
+                .first { $0.processIdentifier != getpid() }?
+                .activate(options: [])
+            exit(0)
+        }
+    }
+
+    private static func acquireInstanceLock() -> Bool {
+        let directory = HistoryStore.defaultURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fd = Darwin.open(directory.appendingPathComponent("instance.lock").path,
+                             O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else { return true }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            Darwin.close(fd)
+            return false
+        }
+        lockFD = fd
+        return true
     }
 
     var body: some Scene {
-        WindowGroup("Agent Monitor", id: "main") {
+        Window("Agent Monitor", id: "main") {
             ContentView(model: model)
                 .frame(minWidth: 740, minHeight: 600)
         }
