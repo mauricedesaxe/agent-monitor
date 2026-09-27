@@ -63,10 +63,15 @@ public struct MinuteRecord: Sendable {
     public let meanRAM: Double
     public let maxRAM: Double
     public let maxDiskWriteRate: Double
+    public let cpuSum: Double
+    public let ramSum: Double
+    public let diskWriteSum: Double
+    public let legacyActivityFloor: Bool
 
     public init(minute: Int64, harness: Harness, sampleCount: Int, active: Bool,
                 meanCPU: Double, maxCPU: Double, meanRAM: Double, maxRAM: Double,
-                maxDiskWriteRate: Double) {
+                maxDiskWriteRate: Double, cpuSum: Double? = nil, ramSum: Double? = nil,
+                diskWriteSum: Double? = nil, legacyActivityFloor: Bool = false) {
         self.minute = minute
         self.harness = harness
         self.sampleCount = sampleCount
@@ -76,6 +81,10 @@ public struct MinuteRecord: Sendable {
         self.meanRAM = meanRAM
         self.maxRAM = maxRAM
         self.maxDiskWriteRate = maxDiskWriteRate
+        self.cpuSum = cpuSum ?? meanCPU * Double(sampleCount)
+        self.ramSum = ramSum ?? meanRAM * Double(sampleCount)
+        self.diskWriteSum = diskWriteSum ?? 0
+        self.legacyActivityFloor = legacyActivityFloor
     }
 }
 
@@ -87,10 +96,22 @@ public struct MinuteAccumulator {
     private var maxRAM = 0.0
     private var maxDiskWriteRate = 0.0
     private var diskWriteSum = 0.0
+    private var legacyActivityFloor = false
 
     public init() {}
 
-    public mutating func add(_ usage: ResourceUsage, active isActive: Bool) {
+    public init(checkpoint: MinuteRecord) {
+        count = checkpoint.sampleCount
+        cpuSum = checkpoint.cpuSum
+        ramSum = checkpoint.ramSum
+        maxCPU = checkpoint.maxCPU
+        maxRAM = checkpoint.maxRAM
+        maxDiskWriteRate = checkpoint.maxDiskWriteRate
+        diskWriteSum = checkpoint.diskWriteSum
+        legacyActivityFloor = checkpoint.legacyActivityFloor
+    }
+
+    public mutating func add(_ usage: ResourceUsage) {
         count += 1
         cpuSum += usage.cpuPercent
         ramSum += Double(usage.footprintBytes)
@@ -100,14 +121,68 @@ public struct MinuteAccumulator {
         diskWriteSum += usage.diskWriteBytesPerSecond
     }
 
+    public mutating func merge(_ other: MinuteAccumulator) {
+        count += other.count
+        cpuSum += other.cpuSum
+        ramSum += other.ramSum
+        maxCPU = max(maxCPU, other.maxCPU)
+        maxRAM = max(maxRAM, other.maxRAM)
+        maxDiskWriteRate = max(maxDiskWriteRate, other.maxDiskWriteRate)
+        diskWriteSum += other.diskWriteSum
+        legacyActivityFloor = legacyActivityFloor || other.legacyActivityFloor
+    }
+
     public func record(minute: Int64, harness: Harness) -> MinuteRecord? {
         guard count > 0 else { return nil }
         let meanCPU = cpuSum / Double(count)
-        let working = count >= 20 && (meanCPU >= 5 || diskWriteSum / Double(count) >= 100 * 1024)
+        let working = legacyActivityFloor || meanCPU >= 5 || diskWriteSum / Double(count) >= 100 * 1024
         return MinuteRecord(minute: minute, harness: harness, sampleCount: count,
                             active: working, meanCPU: meanCPU, maxCPU: maxCPU,
                             meanRAM: ramSum / Double(count), maxRAM: maxRAM,
-                            maxDiskWriteRate: maxDiskWriteRate)
+                            maxDiskWriteRate: maxDiskWriteRate, cpuSum: cpuSum,
+                            ramSum: ramSum, diskWriteSum: diskWriteSum,
+                            legacyActivityFloor: legacyActivityFloor)
+    }
+}
+
+@_spi(Testing) public struct MinuteBuffer {
+    private var accumulators: [Int64: [Harness: MinuteAccumulator]] = [:]
+
+    public init() {}
+
+    public var minutes: Set<Int64> { Set(accumulators.keys) }
+
+    public mutating func add(_ sample: LiveSample) {
+        let minute = Int64(sample.timestamp.timeIntervalSince1970 / 60)
+        var byHarness = accumulators[minute] ?? [:]
+        for harness in Harness.allCases {
+            var accumulator = byHarness[harness] ?? MinuteAccumulator()
+            accumulator.add(sample.usage[harness] ?? ResourceUsage())
+            byHarness[harness] = accumulator
+        }
+        accumulators[minute] = byHarness
+    }
+
+    public mutating func merge(_ checkpoint: MinuteRecord) {
+        var byHarness = accumulators[checkpoint.minute] ?? [:]
+        var accumulator = byHarness[checkpoint.harness] ?? MinuteAccumulator()
+        accumulator.merge(MinuteAccumulator(checkpoint: checkpoint))
+        byHarness[checkpoint.harness] = accumulator
+        accumulators[checkpoint.minute] = byHarness
+    }
+
+    public func records() -> [MinuteRecord] {
+        accumulators.flatMap { minute, byHarness in
+            byHarness.compactMap { harness, accumulator in
+                accumulator.record(minute: minute, harness: harness)
+            }
+        }
+    }
+
+    public mutating func persist(currentMinute: Int64,
+                                 using writer: ([MinuteRecord]) throws -> Void) throws {
+        try writer(records())
+        accumulators = accumulators.filter { $0.key >= currentMinute }
     }
 }
 

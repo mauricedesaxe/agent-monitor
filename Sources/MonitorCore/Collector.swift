@@ -3,15 +3,36 @@ import Foundation
 public final class Collector {
     private let queue = DispatchQueue(label: "AgentMonitor.collector", qos: .utility)
     private var timer: DispatchSourceTimer?
-    private let sampler = ProcessSampler()
+    private let sampleProvider: () -> LiveSample
+    private let storeFactory: () throws -> HistoryStore
+    private let dateProvider: () -> Date
     private var store: HistoryStore?
-    private var accumulators: [Int64: [Harness: MinuteAccumulator]] = [:]
+    private var buffer = MinuteBuffer()
     private var lastFlush = Date()
     private var sampleNumber = 0
+    private var hydratedStore = false
+    private var persistenceFailed = false
     public var onSample: ((LiveSample) -> Void)?
-    public var onError: ((String) -> Void)?
+    public var onError: ((String?) -> Void)?
 
-    public init() {}
+    public init() {
+        let sampler = ProcessSampler()
+        sampleProvider = sampler.sample
+        storeFactory = { try HistoryStore() }
+        dateProvider = Date.init
+    }
+
+    @_spi(Testing) public init(sampleProvider: @escaping () -> LiveSample,
+                               storeFactory: @escaping () throws -> HistoryStore,
+                               dateProvider: @escaping () -> Date) {
+        self.sampleProvider = sampleProvider
+        self.storeFactory = storeFactory
+        self.dateProvider = dateProvider
+    }
+
+    @_spi(Testing) public func collectOnce() { queue.sync { tick() } }
+
+    @_spi(Testing) public func flushNow() { queue.sync { flush() } }
 
     public func start() {
         guard timer == nil else { return }
@@ -29,36 +50,59 @@ public final class Collector {
     }
 
     private func tick() {
+        let sample = sampleProvider()
+        let sampleMinute = Int64(sample.timestamp.timeIntervalSince1970 / 60)
         if store == nil {
-            do { store = try HistoryStore() }
-            catch { onError?("History cannot be saved: \(error)") }
+            do {
+                store = try storeFactory()
+                try hydrateFromStore(including: sampleMinute)
+            }
+            catch {
+                store = nil
+                reportPersistenceError(error)
+            }
         }
-        let sample = sampler.sample()
-        let minute = Int64(sample.timestamp.timeIntervalSince1970 / 60)
-        var byHarness = accumulators[minute] ?? [:]
-        for harness in Harness.allCases {
-            var accumulator = byHarness[harness] ?? MinuteAccumulator()
-            accumulator.add(sample.usage[harness] ?? ResourceUsage(), active: sample.active)
-            byHarness[harness] = accumulator
+        if sample.scanFailed {
+            onSample?(sample)
+            return
         }
-        accumulators[minute] = byHarness
+        buffer.add(sample)
         sampleNumber += 1
         if sampleNumber % 2 == 0 { onSample?(sample) }
-        if Date().timeIntervalSince(lastFlush) >= 30 {
+        if dateProvider().timeIntervalSince(lastFlush) >= 30 {
             flush()
-            lastFlush = Date()
+            lastFlush = dateProvider()
         }
     }
 
     private func flush() {
-        let records = accumulators.flatMap { minute, byHarness in
-            byHarness.compactMap { harness, accumulator in
-                accumulator.record(minute: minute, harness: harness)
+        guard let store else { return }
+        let currentMinute = Int64(dateProvider().timeIntervalSince1970 / 60)
+        do {
+            try buffer.persist(currentMinute: currentMinute, using: store.upsert)
+            if persistenceFailed {
+                persistenceFailed = false
+                onError?(nil)
             }
         }
-        do { try store?.upsert(records) }
-        catch { onError?("History cannot be saved: \(error)") }
-        let currentMinute = Int64(Date().timeIntervalSince1970 / 60)
-        accumulators = accumulators.filter { $0.key >= currentMinute }
+        catch {
+            reportPersistenceError(error)
+            return
+        }
+    }
+
+    private func reportPersistenceError(_ error: Error) {
+        persistenceFailed = true
+        onError?("History cannot be saved: \(error)")
+    }
+
+    private func hydrateFromStore(including sampleMinute: Int64) throws {
+        guard let store, !hydratedStore else { return }
+        let currentMinute = Int64(dateProvider().timeIntervalSince1970 / 60)
+        let minutes = buffer.minutes.union([currentMinute, sampleMinute])
+        for checkpoint in try store.checkpoints(for: minutes) {
+            buffer.merge(checkpoint)
+        }
+        hydratedStore = true
     }
 }

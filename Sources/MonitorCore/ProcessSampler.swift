@@ -108,38 +108,58 @@ public final class ProcessSampler {
     private var knownOwners: [Int32: Harness] = [:]
     private var lastDiscovery: UInt64?
     private var lastUnreadable = 0
-    private var scanFailed = false
     private let ownPID = getpid()
     private let timebase: mach_timebase_info_data_t
     private let discoveryIntervalNanos: UInt64
+    private let clock: () -> UInt64
+    private let discoveryReader: (() -> ([ProcessReading], [Int32: Harness], Int, Bool))?
+    private let knownProcessReader: (([ProcessReading]) -> ([ProcessReading], Int))?
 
     public init(discoveryIntervalSeconds: Double = 2) {
-        discoveryIntervalNanos = UInt64(max(0.5, discoveryIntervalSeconds) * 1_000_000_000)
+        self.discoveryIntervalNanos = UInt64(max(0.5, discoveryIntervalSeconds) * 1_000_000_000)
+        self.clock = { DispatchTime.now().uptimeNanoseconds }
+        self.discoveryReader = nil
+        self.knownProcessReader = nil
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
         timebase = info
     }
 
+    @_spi(Testing) public init(discoveryIntervalSeconds: Double = 2, clock: @escaping () -> UInt64,
+                               discoveryReader: @escaping () -> ([ProcessReading], [Int32: Harness], Int, Bool),
+                               knownProcessReader: @escaping ([ProcessReading]) -> ([ProcessReading], Int)) {
+        discoveryIntervalNanos = UInt64(max(0.5, discoveryIntervalSeconds) * 1_000_000_000)
+        self.clock = clock
+        self.discoveryReader = discoveryReader
+        self.knownProcessReader = knownProcessReader
+        var info = mach_timebase_info_data_t()
+        info.numer = 1
+        info.denom = 1
+        self.timebase = info
+    }
+
     public func sample() -> LiveSample {
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = clock()
         let shouldDiscover = lastDiscovery.map { now - $0 >= discoveryIntervalNanos } ?? true
         var readings: [ProcessReading]
         var unreadableCount: Int
         if shouldDiscover {
-            let discovery = readProcesses()
+            let discovery = discoveryReader?() ?? readProcesses()
             if !discovery.3 {
                 known = discovery.0
                 knownOwners = discovery.1
                 lastUnreadable = discovery.2
-                scanFailed = false
             } else {
-                scanFailed = true
+                lastDiscovery = now
+                let usage = Dictionary(uniqueKeysWithValues: Harness.allCases.map { ($0, ResourceUsage()) })
+                return LiveSample(timestamp: Date(), usage: usage, active: false,
+                                  unreadableAgentProcesses: lastUnreadable, scanFailed: true)
             }
             lastDiscovery = now
             readings = known
             unreadableCount = lastUnreadable
         } else {
-            (readings, unreadableCount) = pollKnown()
+            (readings, unreadableCount) = knownProcessReader?(known) ?? pollKnown()
             unreadableCount = max(lastUnreadable, unreadableCount)
         }
         let attribution = knownOwners
@@ -173,7 +193,7 @@ public final class ProcessSampler {
         priorTime = now
         let active = combined.cpuPercent >= 5 || combined.diskWriteBytesPerSecond >= 100 * 1024
         return LiveSample(timestamp: Date(), usage: usage, active: active,
-                          unreadableAgentProcesses: unreadableCount, scanFailed: scanFailed)
+                          unreadableAgentProcesses: unreadableCount, scanFailed: false)
     }
 
     private func pollKnown() -> ([ProcessReading], Int) {

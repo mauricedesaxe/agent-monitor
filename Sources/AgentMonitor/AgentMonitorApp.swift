@@ -9,6 +9,12 @@ struct AgentMonitorApp: App {
     @StateObject private var model = MonitorModel()
     private static var lockFD: Int32 = -1
 
+    private enum InstanceLockResult {
+        case acquired
+        case alreadyRunning
+        case failed(String)
+    }
+
     init() {
         if CommandLine.arguments.contains("--snapshot") {
             let sampler = ProcessSampler()
@@ -36,26 +42,41 @@ struct AgentMonitorApp: App {
             FileHandle.standardOutput.write(Data([10]))
             exit(0)
         }
-        if !Self.acquireInstanceLock() {
+        switch Self.acquireInstanceLock() {
+        case .acquired:
+            break
+        case .alreadyRunning:
             NSRunningApplication.runningApplications(withBundleIdentifier: "com.lazar.agentmonitor")
                 .first { $0.processIdentifier != getpid() }?
                 .activate(options: [])
             exit(0)
+        case .failed(let reason):
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Agent Monitor couldn't start"
+            alert.informativeText = "It couldn't open its single-instance lock. \(reason)"
+            alert.runModal()
+            exit(1)
         }
     }
 
-    private static func acquireInstanceLock() -> Bool {
+    private static func acquireInstanceLock() -> InstanceLockResult {
         let directory = HistoryStore.defaultURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
         let fd = Darwin.open(directory.appendingPathComponent("instance.lock").path,
                              O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else { return true }
+        guard fd >= 0 else { return .failed(String(cString: strerror(errno))) }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let lockError = errno
             Darwin.close(fd)
-            return false
+            return lockError == EWOULDBLOCK ? .alreadyRunning : .failed(String(cString: strerror(lockError)))
         }
         lockFD = fd
-        return true
+        return .acquired
     }
 
     var body: some Scene {
@@ -80,6 +101,8 @@ final class MonitorModel: ObservableObject {
     @Published var recent: [LiveSample] = []
     @Published var history: [MinuteRecord] = []
     @Published var error: String?
+    @Published var historyError: String?
+    @Published var scanFailed = false
     @Published var selectedDays = 7
     @Published var selectedHarness: Harness = .all
 
@@ -91,12 +114,19 @@ final class MonitorModel: ObservableObject {
         collector.onSample = { [weak self] sample in
             DispatchQueue.main.async {
                 guard let self else { return }
+                if sample.scanFailed {
+                    if !self.scanFailed { self.scanFailed = true }
+                    return
+                }
+                let recoveredFromFailedScan = self.scanFailed
+                if recoveredFromFailedScan { self.scanFailed = false }
                 self.recentSamples.append(sample)
-                if self.recentSamples.count > 60 {
-                    self.recentSamples.removeFirst(self.recentSamples.count - 60)
+                self.recentSamples.removeAll { $0.timestamp < sample.timestamp.addingTimeInterval(-60) }
+                if self.recentSamples.count > 120 {
+                    self.recentSamples.removeFirst(self.recentSamples.count - 120)
                 }
                 let windowVisible = NSApp.windows.contains { $0.title == "Agent Monitor" && $0.isVisible }
-                if windowVisible {
+                if windowVisible || recoveredFromFailedScan {
                     self.live = sample
                     self.recent = self.recentSamples
                     self.lastPublished = sample.timestamp
@@ -121,8 +151,9 @@ final class MonitorModel: ObservableObject {
             let store = try HistoryStore()
             history = try store.records(since: Date().addingTimeInterval(-Double(selectedDays) * 86_400),
                                         harness: selectedHarness)
+            historyError = nil
         } catch {
-            self.error = "History cannot be read: \(error)"
+            historyError = "History cannot be read: \(error)"
         }
     }
 }
@@ -145,7 +176,11 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if let live = model.live {
+                if model.scanFailed {
+                    Label("Scan unavailable", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if let live = model.live {
                     HStack(spacing: 6) {
                         Circle().fill(live.active ? .green : .orange).frame(width: 7, height: 7)
                         Text(live.active ? "Working" : "Quiet")
@@ -196,58 +231,66 @@ private struct LiveView: View {
                     .foregroundStyle(.orange)
                     .font(.callout)
             }
-            if model.live?.scanFailed == true {
-                Label("Process scan failed. Live values are unavailable.", systemImage: "exclamationmark.triangle.fill")
+            if model.scanFailed {
+                Label(model.live == nil
+                      ? "Process scan failed. Waiting for a valid reading."
+                      : "Process scan failed. Showing the last valid reading.",
+                      systemImage: "exclamationmark.triangle.fill")
                     .font(.callout).foregroundStyle(.orange)
             } else if let count = model.live?.unreadableAgentProcesses, count > 0 {
                 Label("\(count) agent processes could not be read. Totals may be low.", systemImage: "exclamationmark.triangle.fill")
                     .font(.callout).foregroundStyle(.orange)
             }
-            HStack(alignment: .top, spacing: 14) {
-                MetricCard(title: "Physical memory", value: bytes(total.footprintBytes),
-                           detail: "Combined agent footprint", symbol: "memorychip", tint: .teal,
-                           prominent: true)
-                MetricCard(title: "CPU", value: String(format: "%.1f%%", total.cpuPercent),
-                           detail: "100% = one CPU core", symbol: "cpu", tint: .indigo,
-                           prominent: false)
-            }
-            HStack(spacing: 14) {
-                SmallMetric(title: "Processes", value: "\(total.processCount)", icon: "square.stack.3d.up")
-                SmallMetric(title: "SSD writes", value: bytesPerSecond(total.diskWriteBytesPerSecond),
-                            icon: "internaldrive")
-                SmallMetric(title: "SSD reads", value: bytesPerSecond(total.diskReadBytesPerSecond),
-                            icon: "arrow.down.to.line")
-            }
-            HStack {
-                Text("By harness").font(.headline)
-                Spacer()
-                Text("One live sample per second")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(Harness.individual) { harness in
-                HarnessRow(harness: harness, usage: model.live?.usage[harness] ?? ResourceUsage())
-            }
-            VStack(alignment: .leading, spacing: 12) {
+            if model.live == nil {
+                ContentUnavailableView("Waiting for process data", systemImage: "waveform.path",
+                                       description: Text("Resource values will appear after a successful scan."))
+            } else {
+                HStack(alignment: .top, spacing: 14) {
+                    MetricCard(title: "Physical memory", value: bytes(total.footprintBytes),
+                               detail: "Combined agent footprint", symbol: "memorychip", tint: .teal,
+                               prominent: true)
+                    MetricCard(title: "CPU", value: String(format: "%.1f%%", total.cpuPercent),
+                               detail: "100% = one CPU core", symbol: "cpu", tint: .indigo,
+                               prominent: false)
+                }
+                HStack(spacing: 14) {
+                    SmallMetric(title: "Processes", value: "\(total.processCount)", icon: "square.stack.3d.up")
+                    SmallMetric(title: "SSD writes", value: bytesPerSecond(total.diskWriteBytesPerSecond),
+                                icon: "internaldrive")
+                    SmallMetric(title: "SSD reads", value: bytesPerSecond(total.diskReadBytesPerSecond),
+                                icon: "arrow.down.to.line")
+                }
                 HStack {
-                    Text("Last minute").font(.headline)
+                    Text("By harness").font(.headline)
                     Spacer()
-                    Text("Physical memory")
+                    Text("One live sample per second")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Chart(Array(model.recent.enumerated()), id: \.offset) { index, sample in
-                    AreaMark(x: .value("Sample", index),
-                             y: .value("RAM", Double(sample.usage[.all]?.footprintBytes ?? 0) / 1_073_741_824))
-                        .foregroundStyle(.teal.opacity(0.16))
-                    LineMark(x: .value("Sample", index),
-                             y: .value("RAM", Double(sample.usage[.all]?.footprintBytes ?? 0) / 1_073_741_824))
-                        .foregroundStyle(.teal)
-                        .lineStyle(StrokeStyle(lineWidth: 2))
+                ForEach(Harness.individual) { harness in
+                    HarnessRow(harness: harness, usage: model.live?.usage[harness] ?? ResourceUsage())
                 }
-                .chartYAxisLabel("GB")
-                .frame(height: 110)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("Last minute").font(.headline)
+                        Spacer()
+                        Text("Physical memory")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Chart(Array(model.recent.enumerated()), id: \.offset) { index, sample in
+                        AreaMark(x: .value("Sample", index),
+                                 y: .value("RAM", Double(sample.usage[.all]?.footprintBytes ?? 0) / 1_073_741_824))
+                            .foregroundStyle(.teal.opacity(0.16))
+                        LineMark(x: .value("Sample", index),
+                                 y: .value("RAM", Double(sample.usage[.all]?.footprintBytes ?? 0) / 1_073_741_824))
+                            .foregroundStyle(.teal)
+                            .lineStyle(StrokeStyle(lineWidth: 2))
+                    }
+                    .chartYAxisLabel("GB")
+                    .frame(height: 110)
+                }
+                .padding(18)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
             }
-            .padding(18)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
         }
     }
 }
@@ -403,7 +446,7 @@ private struct HistoryView: View {
                 Text("\(active.count) working minutes · A minute counts when mean CPU is at least 5% of one core or mean SSD writes reach 100 KB/s. Open, idle apps stay in live RAM but usually stay out of these percentiles. Known processes are sampled every 500 ms; new subprocesses are discovered every 2 seconds, so shorter ones can be missed.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if let error = model.error {
+            if let error = model.historyError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -450,7 +493,9 @@ private struct MenuBarContents: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        if let usage = model.live?.usage[.all] {
+        if model.scanFailed {
+            Text("Agents · process scan unavailable")
+        } else if let usage = model.live?.usage[.all] {
             Text("Agents · \(bytes(usage.footprintBytes)) RAM · \(String(format: "%.1f", usage.cpuPercent))% CPU")
         } else {
             Text("Sampling agents…")
