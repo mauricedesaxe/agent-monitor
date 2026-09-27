@@ -389,7 +389,7 @@ private struct HistoryView: View {
                 }
                 .padding(18)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
-                Text("\(active.count) working minutes · A minute counts when mean CPU is at least 5% of one core or mean SSD writes reach 100 KB/s. Open, idle apps stay in live RAM but usually stay out of these percentiles.")
+                Text("\(active.count) working minutes · A minute counts when mean CPU is at least 5% of one core or mean SSD writes reach 100 KB/s. Open, idle apps stay in live RAM but usually stay out of these percentiles. Known processes are sampled every 500 ms; new subprocesses are discovered every 2 seconds, so shorter ones can be missed.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let error = model.error {

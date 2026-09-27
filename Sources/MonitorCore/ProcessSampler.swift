@@ -32,6 +32,7 @@ public enum ProcessAttribution {
         let byPID = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
         var result: [Int32: Harness] = [:]
         var excluded: Set<Int32> = [ownPID]
+        var unmatched: Set<Int32> = []
         let children = Dictionary(grouping: processes, by: \.parentPID)
         var toExclude = [ownPID]
         while let parent = toExclude.popLast() {
@@ -43,6 +44,7 @@ public enum ProcessAttribution {
         func owner(of pid: Int32, visiting: inout Set<Int32>) -> Harness? {
             if excluded.contains(pid) { return nil }
             if let known = result[pid] { return known }
+            if unmatched.contains(pid) { return nil }
             guard let process = byPID[pid], !visiting.contains(pid) else { return nil }
             visiting.insert(pid)
             defer { visiting.remove(pid) }
@@ -63,6 +65,7 @@ public enum ProcessAttribution {
                 result[pid] = parent
                 return parent
             }
+            unmatched.insert(pid)
             return nil
         }
 
@@ -101,10 +104,17 @@ private struct ProcessKey: Hashable {
 public final class ProcessSampler {
     private var prior: [ProcessKey: ProcessReading] = [:]
     private var priorTime: UInt64?
+    private var known: [ProcessReading] = []
+    private var knownOwners: [Int32: Harness] = [:]
+    private var lastDiscovery: UInt64?
+    private var lastUnreadable = 0
+    private var scanFailed = false
     private let ownPID = getpid()
     private let timebase: mach_timebase_info_data_t
+    private let discoveryIntervalNanos: UInt64
 
-    public init() {
+    public init(discoveryIntervalSeconds: Double = 2) {
+        discoveryIntervalNanos = UInt64(max(0.5, discoveryIntervalSeconds) * 1_000_000_000)
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
         timebase = info
@@ -112,7 +122,27 @@ public final class ProcessSampler {
 
     public func sample() -> LiveSample {
         let now = DispatchTime.now().uptimeNanoseconds
-        let (readings, attribution, unreadableCount, scanFailed) = readProcesses()
+        let shouldDiscover = lastDiscovery.map { now - $0 >= discoveryIntervalNanos } ?? true
+        var readings: [ProcessReading]
+        var unreadableCount: Int
+        if shouldDiscover {
+            let discovery = readProcesses()
+            if !discovery.3 {
+                known = discovery.0
+                knownOwners = discovery.1
+                lastUnreadable = discovery.2
+                scanFailed = false
+            } else {
+                scanFailed = true
+            }
+            lastDiscovery = now
+            readings = known
+            unreadableCount = lastUnreadable
+        } else {
+            (readings, unreadableCount) = pollKnown()
+            unreadableCount = max(lastUnreadable, unreadableCount)
+        }
+        let attribution = knownOwners
         let elapsed = priorTime.map { Double(now - $0) / 1_000_000_000 } ?? 0
         var usage = Dictionary(uniqueKeysWithValues: Harness.allCases.map { ($0, ResourceUsage()) })
         var current: [ProcessKey: ProcessReading] = [:]
@@ -144,6 +174,33 @@ public final class ProcessSampler {
         let active = combined.cpuPercent >= 5 || combined.diskWriteBytesPerSecond >= 100 * 1024
         return LiveSample(timestamp: Date(), usage: usage, active: active,
                           unreadableAgentProcesses: unreadableCount, scanFailed: scanFailed)
+    }
+
+    private func pollKnown() -> ([ProcessReading], Int) {
+        var readings: [ProcessReading] = []
+        readings.reserveCapacity(known.count)
+        var unreadable = 0
+        for process in known {
+            var rusage = rusage_info_v4()
+            let status = withUnsafeMutablePointer(to: &rusage) { pointer in
+                pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                    proc_pid_rusage(process.pid, RUSAGE_INFO_V4, $0)
+                }
+            }
+            guard status == 0 else {
+                if errno == EPERM || errno == EACCES { unreadable += 1 }
+                continue
+            }
+            guard rusage.ri_proc_start_abstime == process.startTicks else { continue }
+            readings.append(ProcessReading(pid: process.pid, parentPID: process.parentPID,
+                                           name: process.name, path: process.path,
+                                           startTicks: rusage.ri_proc_start_abstime,
+                                           cpuTicks: rusage.ri_user_time + rusage.ri_system_time,
+                                           footprintBytes: rusage.ri_phys_footprint,
+                                           diskReadBytes: rusage.ri_diskio_bytesread,
+                                           diskWriteBytes: rusage.ri_diskio_byteswritten))
+        }
+        return (readings, unreadable)
     }
 
     private func readProcesses() -> ([ProcessReading], [Int32: Harness], Int, Bool) {

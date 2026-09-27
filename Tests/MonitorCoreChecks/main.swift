@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import MonitorCore
 
 func reading(_ pid: Int32, _ parentPID: Int32, _ name: String, _ path: String) -> ProcessReading {
@@ -52,3 +53,26 @@ precondition(loaded[0].sampleCount == 120)
 try? FileManager.default.removeItem(at: databaseURL)
 
 print("Core checks passed")
+
+if let benchmarkIndex = CommandLine.arguments.firstIndex(of: "--benchmark"),
+   CommandLine.arguments.indices.contains(benchmarkIndex + 1),
+   let interval = Double(CommandLine.arguments[benchmarkIndex + 1]) {
+    let sampler = ProcessSampler(discoveryIntervalSeconds: interval)
+    var before = rusage()
+    var after = rusage()
+    getrusage(RUSAGE_SELF, &before)
+    let start = Date()
+    var lastCount = 0
+    while Date().timeIntervalSince(start) < 10 {
+        lastCount = sampler.sample().usage[.all]?.processCount ?? 0
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    getrusage(RUSAGE_SELF, &after)
+    func seconds(_ time: timeval) -> Double {
+        Double(time.tv_sec) + Double(time.tv_usec) / 1_000_000
+    }
+    let cpu = seconds(after.ru_utime) + seconds(after.ru_stime)
+        - seconds(before.ru_utime) - seconds(before.ru_stime)
+    print(String(format: "Discovery %.1f s: %.2f%% of one core, %d tracked processes",
+                 interval, cpu / Date().timeIntervalSince(start) * 100, lastCount))
+}
