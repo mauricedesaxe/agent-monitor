@@ -84,14 +84,25 @@ final class MonitorModel: ObservableObject {
     @Published var selectedHarness: Harness = .all
 
     private let collector = Collector()
+    private var recentSamples: [LiveSample] = []
+    private var lastPublished = Date.distantPast
 
     init() {
         collector.onSample = { [weak self] sample in
             DispatchQueue.main.async {
-                self?.live = sample
-                self?.recent.append(sample)
-                if let count = self?.recent.count, count > 60 {
-                    self?.recent.removeFirst(count - 60)
+                guard let self else { return }
+                self.recentSamples.append(sample)
+                if self.recentSamples.count > 60 {
+                    self.recentSamples.removeFirst(self.recentSamples.count - 60)
+                }
+                let windowVisible = NSApp.windows.contains { $0.title == "Agent Monitor" && $0.isVisible }
+                if windowVisible {
+                    self.live = sample
+                    self.recent = self.recentSamples
+                    self.lastPublished = sample.timestamp
+                } else if sample.timestamp.timeIntervalSince(self.lastPublished) >= 5 {
+                    self.live = sample
+                    self.lastPublished = sample.timestamp
                 }
             }
         }
