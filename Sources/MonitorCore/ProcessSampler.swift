@@ -237,7 +237,9 @@ public final class ProcessSampler {
             let bsdBytes = withUnsafeMutablePointer(to: &bsd) {
                 proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, $0, Int32(MemoryLayout<proc_bsdinfo>.size))
             }
-            guard bsdBytes == MemoryLayout<proc_bsdinfo>.size else { continue }
+            guard bsdBytes == MemoryLayout<proc_bsdinfo>.size,
+                  bsd.pbi_flags & UInt32(PROC_FLAG_INEXIT) == 0,
+                  bsd.pbi_status != UInt32(SZOMB) else { continue }
             let name = withUnsafePointer(to: bsd.pbi_name) {
                 String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self))
             }
