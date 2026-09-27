@@ -30,3 +30,16 @@ Run `./scripts/check-quality.sh quick` to build the whole package with complete 
 The generator checks process ownership graphs and minute history across failed writes, SQLite migration, and collector restarts. Each history case uses a new temporary SQLite directory. The checks never open the app's database or scan live processes. They run only when invoked and add no work to the app. The installed Apple Swift toolchain has no usable macOS libFuzzer runtime, so these are seeded cases without coverage feedback.
 
 Run one reported failure directly with `CLANG_MODULE_CACHE_PATH=/private/tmp/agent-monitor-clang-cache swift run --disable-sandbox MonitorCoreFuzz --domain history --seed 173 --case 284`. Use `--domain attribution` for a process case. The failure prints its seed, case number, invariant, and fixture. Run `bd ready` for local project tasks.
+
+## Packaged app QA
+
+Build the bundle first with `./scripts/build-app.sh`. Then run:
+
+```sh
+python3 scripts/qa-app.py e2e
+python3 scripts/qa-app.py profile --duration 60 --interval 0.5 --output /private/tmp/agent-monitor-profile.json
+```
+
+The E2E check compiles a small `opencode` workload with the system clang, then starts it and the packaged app with `AGENT_MONITOR_DATA_DIR` set to a temporary absolute directory. The variable moves both the SQLite database and the app's single-instance lock; when it is unset or not an absolute path, the app uses its normal Application Support directory. The workload uses CPU and touches 16 MiB of memory. The check verifies that the packaged `--snapshot` command detects the process, more than 5% CPU use, and at least 8 MiB of added memory. It then waits for active OpenCode and All agents rows with CPU and memory use in SQLite, and checks that attribution clears after the workload stops. It can take about a minute because the app persists history every 30 seconds. The test never opens your normal history database or stops processes it did not start.
+
+The profiler measures the packaged app's own PID, with CPU as a percent of one core and CPU and RSS percentiles. It also reports the combined size of the SQLite database, WAL, and shared-memory files. `--output` saves per-sample JSON, or CSV when the path ends in `.csv`. Add `--stacks /private/tmp/agent-monitor-stacks.txt` to capture a separate five-second macOS CPU stack sample after the metrics run. Its numbers are observations, not pass/fail budgets. Run it on an otherwise quiet Mac for comparisons. The E2E check exercises process discovery and persistence; inspect the visible Live and History views manually when changing UI behavior.

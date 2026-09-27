@@ -5,6 +5,11 @@ public final class HistoryStore {
     private var database: OpaquePointer?
 
     public static var defaultURL: URL {
+        if let override = ProcessInfo.processInfo.environment["AGENT_MONITOR_DATA_DIR"],
+           (override as NSString).isAbsolutePath {
+            return URL(fileURLWithPath: override, isDirectory: true)
+                .appendingPathComponent("history.sqlite3")
+        }
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Agent Monitor", isDirectory: true)
         return directory.appendingPathComponent("history.sqlite3")
