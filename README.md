@@ -2,6 +2,8 @@
 
 Agent Monitor is a native Swift app for macOS. It shows the combined CPU and memory use of Codex, Claude Code, and OpenCode, with a row for each tool. A History view shows typical active minutes and P50, P90, P95, and P99 of short sample peaks. The app stores history in SQLite on this Mac.
 
+<img width="2916" height="3336" alt="image" src="https://github.com/user-attachments/assets/13381648-5da7-4968-b04f-e117a869591a" />
+
 ## Run it
 
 Build the app with the macOS Command Line Tools:
