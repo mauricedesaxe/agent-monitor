@@ -10,5 +10,7 @@ let package = Package(
         .executableTarget(name: "AgentMonitor", dependencies: ["MonitorCore"]),
         .executableTarget(name: "MonitorCoreChecks", dependencies: ["MonitorCore"],
                           path: "Tests/MonitorCoreChecks"),
+        .executableTarget(name: "MonitorCoreFuzz", dependencies: ["MonitorCore"],
+                          path: "Tests/MonitorCoreFuzz"),
     ]
 )

@@ -186,36 +186,37 @@ do {
 let busyURL = temporaryDatabaseURL()
 do {
     defer { removeDatabase(at: busyURL) }
-    let busyStore = try HistoryStore(url: busyURL)
     var blocker: OpaquePointer?
     precondition(sqlite3_open(busyURL.path, &blocker) == SQLITE_OK)
     defer { sqlite3_close(blocker) }
-    precondition(sqlite3_exec(blocker, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK)
+    let ready = DispatchSemaphore(value: 0)
+    let startWrite = DispatchSemaphore(value: 0)
     let finished = DispatchSemaphore(value: 0)
-    let errorLock = NSLock()
-    var writeError: Error?
+    let succeeded = DispatchSemaphore(value: 0)
     DispatchQueue.global().async {
         defer { finished.signal() }
         do {
+            let busyStore = try HistoryStore(url: busyURL)
+            ready.signal()
+            guard startWrite.wait(timeout: .now() + 3) == .success else { return }
             let record = MinuteRecord(minute: 7, harness: .all, sampleCount: 1, active: false,
                                       meanCPU: 1, maxCPU: 1, meanRAM: 2, maxRAM: 2,
                                       maxDiskWriteRate: 3, cpuSum: 1, ramSum: 2,
                                       diskWriteSum: 3)
             try busyStore.upsert([record])
+            succeeded.signal()
         } catch {
-            errorLock.lock()
-            writeError = error
-            errorLock.unlock()
+            return
         }
     }
+    precondition(ready.wait(timeout: .now() + 3) == .success)
+    precondition(sqlite3_exec(blocker, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK)
+    startWrite.signal()
     usleep(200_000)
     precondition(sqlite3_exec(blocker, "COMMIT", nil, nil, nil) == SQLITE_OK)
     precondition(finished.wait(timeout: .now() + 3) == .success)
-    errorLock.lock()
-    let capturedWriteError = writeError
-    errorLock.unlock()
-    precondition(capturedWriteError == nil)
-    let busyRecords = try busyStore.records(since: .distantPast, harness: .all)
+    precondition(succeeded.wait(timeout: .now()) == .success)
+    let busyRecords = try HistoryStore(url: busyURL).records(since: .distantPast, harness: .all)
     precondition(busyRecords.count == 1)
 }
 

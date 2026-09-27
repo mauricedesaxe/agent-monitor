@@ -23,4 +23,10 @@ Keep the app open to collect history. You can close its window and use the menu 
 
 The app needs to run outside the macOS App Sandbox to inspect other processes. It does not require root and does not send data to a server. Brief processes may start and exit between discovery scans, so their resource use may be missed.
 
-Run the core checks with `CLANG_MODULE_CACHE_PATH=/private/tmp/agent-monitor-clang-cache swift run --disable-sandbox MonitorCoreChecks`. Run `bd ready` for local project tasks.
+## Check changes
+
+Run `./scripts/check-quality.sh quick` to build the whole package with complete concurrency checks and warnings treated as errors. It also runs the existing core checks and 10 generated cases in each domain. Run `./scripts/check-quality.sh full` to check 40 cases per domain under AddressSanitizer and ThreadSanitizer as well. Pass `--iterations 500` for a longer run or `--seed 173` to use a chosen seed.
+
+The generator checks process ownership graphs and minute history across failed writes, SQLite migration, and collector restarts. Each history case uses a new temporary SQLite directory. The checks never open the app's database or scan live processes. They run only when invoked and add no work to the app. The installed Apple Swift toolchain has no usable macOS libFuzzer runtime, so these are seeded cases without coverage feedback.
+
+Run one reported failure directly with `CLANG_MODULE_CACHE_PATH=/private/tmp/agent-monitor-clang-cache swift run --disable-sandbox MonitorCoreFuzz --domain history --seed 173 --case 284`. Use `--domain attribution` for a process case. The failure prints its seed, case number, invariant, and fixture. Run `bd ready` for local project tasks.
