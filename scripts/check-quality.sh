@@ -43,6 +43,7 @@ printf '%s\n' 'Checking full-package strict concurrency and warnings'
 swift build --disable-sandbox --package-path "$repo_dir" --scratch-path "$scratch/strict" \
 	-Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 swift run --disable-sandbox --package-path "$repo_dir" --scratch-path "$scratch/strict" MonitorCoreChecks
+"$script_dir/check-byte-rate.sh"
 swift run --disable-sandbox --package-path "$repo_dir" --scratch-path "$scratch/strict" MonitorCoreFuzz \
 	--seed "$seed" --iterations "$iterations"
 
