@@ -515,5 +515,5 @@ private func bytes(_ value: UInt64) -> String {
 }
 
 private func bytesPerSecond(_ value: Double) -> String {
-    bytes(UInt64(max(0, min(value, Double(UInt64.max))))) + "/s"
+    bytes(UInt64(max(0, min(value, Double(Int64.max))))) + "/s"
 }
